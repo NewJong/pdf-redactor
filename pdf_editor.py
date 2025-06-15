@@ -7,7 +7,7 @@ import os
 import win32clipboard
 import win32con
 import struct
-
+import time
 class PDFRedactorApp:
     def __init__(self, root):
         self.root = root
