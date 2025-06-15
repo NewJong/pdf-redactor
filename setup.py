@@ -4,7 +4,7 @@ APP = ['pdf_editor.py']
 DATA_FILES = []
 OPTIONS = {
     'argv_emulation': True,
-    'packages': ['PIL', 'fitz'],
+    'packages': ['fitz', 'PIL'],
 }
 
 setup(
