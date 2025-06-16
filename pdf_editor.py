@@ -32,14 +32,23 @@ class PDFRedactorApp:
         self.h_scrollbar = tk.Scrollbar(root, orient="horizontal", command=self.canvas.xview)
         self.canvas.configure(yscrollcommand=self.v_scrollbar.set, xscrollcommand=self.h_scrollbar.set)
 
+        self.current_fill_color = "white"
+        self.pipette_mode = False
+
+        tk.Button(self.toolbar, text="Pipette", command=self.activate_pipette).pack(side="left")
+        tk.Button(self.toolbar, text="Reset color", command=self.reset_fill_color).pack(side="left")
+
         self.v_scrollbar.pack(side="right", fill="y")
         self.h_scrollbar.pack(side="bottom", fill="x")
         self.canvas.pack(fill="both", expand=True)
 
-        self.canvas.bind_all("<MouseWheel>", self.on_mouse_wheel)
+        # self.canvas.bind_all("<MouseWheel>", self.on_mouse_wheel)
         self.canvas.bind_all("<ButtonPress-1>", self.on_mouse_down)
         self.canvas.bind_all("<B1-Motion>", self.on_mouse_drag)
         self.canvas.bind_all("<ButtonRelease-1>", self.on_mouse_up)
+
+        self.root.bind_all("<Control-v>", self.paste_from_clipboard)
+        self.root.bind_all("<Command-v>", self.paste_from_clipboard)
 
         self.root.bind_all("<Key>", self.on_key_press)
         self.root.bind_all("<MouseWheel>", self.on_mouse_wheel_global)
@@ -55,6 +64,16 @@ class PDFRedactorApp:
         self.current_page = None
         self.doc = None
         self.image_mode = False
+        
+
+    def activate_pipette(self):
+        self.pipette_mode = True
+        self.canvas.config(cursor="dot")  
+
+    def reset_fill_color(self):
+        self.current_fill_color = "white"
+        self.pipette_mode = False
+        self.canvas.config(cursor="cross")
 
     def center_window(self, width, height):
         screen_width = self.root.winfo_screenwidth()
@@ -64,8 +83,19 @@ class PDFRedactorApp:
         self.root.geometry(f"{width}x{height}+{x}+{y}")
 
     def on_key_press(self, event):
-        if (event.state & 0x4) and (event.keycode == 90 or event.keysym.lower() in ['z', 'я']):
+        is_ctrl = event.state & 0x4       
+        is_cmd = event.state & 0x10      
+        
+        keycode = event.keycode
+        key = event.keysym.lower()
+
+        if (is_ctrl or is_cmd) and (keycode == 90 or key in ['z', 'я']):
             self.undo_last_rect()
+        elif (is_ctrl or is_cmd) and (keycode == 86 or key in ['v', 'м']):
+            self.paste_from_clipboard()
+        elif (is_ctrl or is_cmd) and (keycode == 67 or key in ['c', 'с']):
+            self.copy_pdf_file_to_clipboard()
+
     def on_right_mouse_down(self, event):
         self.canvas.scan_mark(event.x, event.y)
 
@@ -111,7 +141,6 @@ class PDFRedactorApp:
         self.canvas_images.clear()
         self.image_tks.clear()
         self.page_images.clear()
-        self.page_rects.clear()
         self.current_rect = None
         self.rect_start = None
         self.current_page = None
@@ -126,7 +155,7 @@ class PDFRedactorApp:
             self.image_tks.append(img_tk)
             image_id = self.canvas.create_image(10, y_offset, anchor="nw", image=img_tk, tags=f"page_{page_num}")
             self.canvas_images.append((page_num, image_id))
-            self.page_rects[page_num] = []
+            self.draw_rects_for_page(page_num)
 
             y_offset += pix.height + 20
 
@@ -162,7 +191,8 @@ class PDFRedactorApp:
         self.canvas.delete("all")
         self.canvas_images.clear()
         self.image_tks.clear()
-        self.page_rects.clear()
+        if 0 not in self.page_rects:
+            self.page_rects[0] = []
         self.current_rect = None
         self.rect_start = None
         self.current_page = 0  
@@ -178,13 +208,32 @@ class PDFRedactorApp:
         self.image_tks.append(img_tk)
         image_id = self.canvas.create_image(10, 10, anchor="nw", image=img_tk, tags="image")
         self.canvas_images.append((0, image_id))
-        self.page_rects[0] = []
+        existing_rects = self.page_rects.get(0, [])
+        self.page_rects[0] = existing_rects
 
         self.canvas.config(scrollregion=self.canvas.bbox("all"))
+        self.draw_rects_for_page(0)
+
 
     def on_mouse_down(self, event):
         y = self.canvas.canvasy(event.y)
         x = self.canvas.canvasx(event.x)
+
+        if self.pipette_mode and self.image_mode:
+            image = self.loaded_image
+            bbox = self.canvas.bbox("image")
+            if not bbox:
+                return
+            img_x = int((x - bbox[0]) / self.scale)
+            img_y = int((y - bbox[1]) / self.scale)
+            if 0 <= img_x < image.width and 0 <= img_y < image.height:
+                pixel = image.getpixel((img_x, img_y))
+                self.current_fill_color = '#%02x%02x%02x' % pixel
+                print("Цвет выбран:", self.current_fill_color)
+            self.pipette_mode = False
+            self.canvas.config(cursor="cross")
+            return
+
         page_num, bbox = self.get_page_from_y(y)
         if page_num is None:
             return
@@ -208,22 +257,64 @@ class PDFRedactorApp:
         else:
             page_num = self.current_page
             x0, y0, x1, y1 = coords
-            self.page_rects.setdefault(page_num, []).append((self.current_rect, coords))
-            self.canvas.itemconfig(self.current_rect, fill="white", outline="")
+            x0, x1 = sorted([x0, x1])
+            y0, y1 = sorted([y0, y1])
+            if self.image_mode:
+                bbox = self.canvas.bbox("image")
+            else:
+                bbox = self.canvas.bbox(f"page_{page_num}")
+
+            if not bbox:
+                print("WARNING: bbox not found.")
+                return
+
+            logical_coords = (
+                (x0 - bbox[0]) / self.scale,
+                (y0 - bbox[1]) / self.scale,
+                (x1 - bbox[0]) / self.scale,
+                (y1 - bbox[1]) / self.scale
+            )
+            print(f"Saved rect (logical coords): x0={logical_coords[0]}, y0={logical_coords[1]}, x1={logical_coords[2]}, y1={logical_coords[3]}")
+            self.page_rects.setdefault(page_num, []).append(logical_coords)
+            self.canvas.delete(self.current_rect) 
+            self.draw_rects_for_page(page_num) 
         self.current_rect = None
         self.rect_start = None
 
     def undo_last_rect(self, event=None):
         if self.image_mode:
             if self.page_rects.get(0):
-                rect_id, _ = self.page_rects[0].pop()
-                self.canvas.delete(rect_id)
+                self.page_rects[0].pop()
+                self.draw_rects_for_page(0)
         elif self.doc:
             for page_num in reversed(range(len(self.doc))):
-                if self.page_rects.get(page_num):
-                    rect_id, _ = self.page_rects[page_num].pop()
-                    self.canvas.delete(rect_id)
-                    return
+                rects = self.page_rects.get(page_num, [])
+                if rects:
+                    rects.pop()
+                    self.draw_rects_for_page(page_num)
+                    break
+
+    def draw_rects_for_page(self, page_num):
+        self.canvas.delete(f"rect_page_{page_num}")
+        
+        if self.image_mode:
+            bbox = self.canvas.bbox("image")
+        else:
+            bbox = self.canvas.bbox(f"page_{page_num}")
+        if not bbox:
+            return
+        offset_x, offset_y = bbox[0], bbox[1]
+
+        for rect in self.page_rects.get(page_num, []):
+            x0, y0, x1, y1 = rect
+            
+            x0 = x0 * self.scale + offset_x
+            y0 = y0 * self.scale + offset_y
+            x1 = x1 * self.scale + offset_x
+            y1 = y1 * self.scale + offset_y
+            print(f"Drawn rect: x0={x0}, y0={y0}, x1={x1}, y1={y1}")
+            self.canvas.create_rectangle(x0, y0, x1, y1, fill=self.current_fill_color, outline="", tags=f"rect_page_{page_num}")
+
 
     def on_mouse_wheel(self, event):
         if event.state & 0x0001:  
@@ -238,16 +329,14 @@ class PDFRedactorApp:
 
         if self.image_mode:
             img = self.loaded_image.copy()
-            draw = Image.new("RGB", img.size, "white")
+            draw = Image.new("RGB", img.size, self.current_fill_color)
             draw.paste(img)
 
-            for _, coords in self.page_rects[0]:
+            for coords in self.page_rects.get(0, []):
                 x0, y0, x1, y1 = coords
-                x0 = int((x0 - 10) / self.scale)
-                y0 = int((y0 - 10) / self.scale)
-                x1 = int((x1 - 10) / self.scale)
-                y1 = int((y1 - 10) / self.scale)
-                ImageDraw.Draw(draw).rectangle([x0, y0, x1, y1], fill="white")
+                x0, x1 = sorted([x0, x1])
+                y0, y1 = sorted([y0, y1])
+                ImageDraw.Draw(draw).rectangle([x0, y0, x1, y1], fill=self.current_fill_color)
 
             draw.save(save_path, "PDF")
             return
@@ -257,15 +346,9 @@ class PDFRedactorApp:
 
         for page_num in self.page_rects:
             page = self.doc[page_num]
-            for _, coords in self.page_rects[page_num]:
+            for coords in self.page_rects.get(page_num, []): 
                 x0, y0, x1, y1 = coords
-                bbox = self.canvas.bbox(f"page_{page_num}")
-                rect = fitz.Rect(
-                    (x0 - 10) / self.scale,
-                    (y0 - bbox[1]) / self.scale,
-                    (x1 - 10) / self.scale,
-                    (y1 - bbox[1]) / self.scale,
-                )
+                rect = fitz.Rect(x0, y0, x1, y1)
                 page.add_redact_annot(rect, fill=(1, 1, 1))
             page.apply_redactions()
         self.doc.save(save_path)
@@ -276,16 +359,14 @@ class PDFRedactorApp:
 
         if self.image_mode:
             img = self.loaded_image.copy()
-            draw = Image.new("RGB", img.size, "white")
+            draw = Image.new("RGB", img.size, self.current_fill_color)
             draw.paste(img)
 
-            for _, coords in self.page_rects[0]:
+            for coords in self.page_rects.get(0, []):
                 x0, y0, x1, y1 = coords
-                x0 = int((x0 - 10) / self.scale)
-                y0 = int((y0 - 10) / self.scale)
-                x1 = int((x1 - 10) / self.scale)
-                y1 = int((y1 - 10) / self.scale)
-                ImageDraw.Draw(draw).rectangle([x0, y0, x1, y1], fill="white")
+                x0, x1 = sorted([x0, x1])
+                y0, y1 = sorted([y0, y1])
+                ImageDraw.Draw(draw).rectangle([x0, y0, x1, y1], fill=self.current_fill_color)
 
             draw.save(temp_path, "PDF")
         else:
@@ -294,15 +375,9 @@ class PDFRedactorApp:
             temp_doc = fitz.open(self.filepath)  
             for page_num in self.page_rects:
                 page = temp_doc[page_num]
-                for _, coords in self.page_rects[page_num]:
+                for coords in self.page_rects.get(page_num, []): 
                     x0, y0, x1, y1 = coords
-                    bbox = self.canvas.bbox(f"page_{page_num}")
-                    rect = fitz.Rect(
-                        (x0 - 10) / self.scale,
-                        (y0 - bbox[1]) / self.scale,
-                        (x1 - 10) / self.scale,
-                        (y1 - bbox[1]) / self.scale,
-                    )
+                    rect = fitz.Rect(x0, y0, x1, y1)
                     page.add_redact_annot(rect, fill=(1, 1, 1))
                 page.apply_redactions()
             temp_doc.save(temp_path)
@@ -315,6 +390,44 @@ class PDFRedactorApp:
         win32clipboard.SetClipboardData(win32con.CF_HDROP, data)
         win32clipboard.CloseClipboard()
     
+    def paste_from_clipboard(self, event=None):
+        try:
+            win32clipboard.OpenClipboard()
+            if win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP):
+                files = win32clipboard.GetClipboardData(win32con.CF_HDROP)
+                if files:
+                    filepath = files[0]
+                    ext = filepath.lower().split('.')[-1]
+                    if ext == 'pdf':
+                        self.open_file_from_path(filepath)
+                    elif ext in ('png', 'jpg', 'jpeg', 'jfif'):
+                        self.open_image_dialog(filepath)
+                    else:
+                        tk.messagebox.showerror("Unsupported file", "Only PDF and image files are supported.")
+            win32clipboard.CloseClipboard()
+        except Exception as e:
+            win32clipboard.CloseClipboard()
+            tk.messagebox.showerror("Clipboard Error", f"Could not read clipboard content.\n{str(e)}")
+   
+    def open_file_from_path(self, filepath):
+        self.canvas.delete("all")
+        self.canvas_images.clear()
+        self.image_tks.clear()
+        self.page_images.clear()
+        self.page_rects.clear()
+        self.current_rect = None
+        self.rect_start = None
+        self.current_page = None
+        self.doc = None
+        self.image_mode = False
+
+        self.filepath = filepath
+
+        ext = filepath.lower().split('.')[-1]
+        if ext == 'pdf':
+            self.render_pdf()
+        elif ext in ('png', 'jpg', 'jpeg', 'jfif'):
+            self.open_image_dialog(filepath)
 
 if __name__ == "__main__":
     root = tk.Tk()
